@@ -1,0 +1,71 @@
+@startuml
+title СМО, вариант 8: flowchart с дорожками (все альтернативы процесса)
+
+|Engine|
+start
+:Инициализация: clock = 0, devicePtr = 0
+первые события REQUEST_GENERATED всех источников в календарь;
+
+repeat
+  |Engine|
+  :Извлечь ближайшее событие из календаря
+  clock = event.time;
+
+  if (Тип события?) then (REQUEST_GENERATED)
+    |Source|
+    :Вычислить интервал dt ~ Uniform(min, max) (ИЗ2)
+    запланировать следующее REQUEST_GENERATED;
+    :Создать заявку (приоритет = номер источника);
+
+    |PlacementDispatcher|
+    :Statistics.recordGenerated();
+    |Buffer|
+    if (Буфер полон?) then (нет)
+      :Поставить заявку за последним занятым местом (Д1ОЗ2);
+    else (да)
+      :Удалить последнюю заявку из буфера (Д1ОО4);
+      |PlacementDispatcher|
+      :Statistics.recordRefused() для вытесненной заявки (HTTP 429);
+      |Buffer|
+      :Поставить новую заявку в конец очереди;
+    endif
+  else (SERVICE_FINISHED)
+    |Device|
+    :Прибор освобождается, заявка получает статус DONE;
+    |PlacementDispatcher|
+    :Statistics.recordProcessed();
+  endif
+
+  |SelectionDispatcher|
+  while (Буфер не пуст и есть свободный прибор?) is (да)
+    :Найти свободный прибор по кольцу от devicePtr (Д2П2);
+    |Buffer|
+    :Выбрать одну заявку с минимальным номером источника (Д2Б4)
+    при равенстве - поставленную раньше;
+    :Удалить заявку и сдвинуть очередь на одно место (Д1ОЗ2);
+    |SelectionDispatcher|
+    :Statistics.recordWait();
+    |Device|
+    :Назначить заявку прибору k, время обслуживания ~ Exp(mu) (ПЗ1);
+    |SelectionDispatcher|
+    :devicePtr = (k + 1) mod N
+    запланировать SERVICE_FINISHED;
+  endwhile (нет)
+
+  if (Буфер не пуст?) then (да)
+    :Все приборы заняты, заявки ждут в буфере
+    следующего SERVICE_FINISHED;
+  else (нет)
+    :Приборы свободны или простаивают
+    ждём следующую генерацию;
+  endif
+
+  |Engine|
+  :Пошаговый режим (ОД2): показать состояние системы и календарь;
+repeat while (Календарь не пуст и критерий окончания не достигнут?) is (да) not (нет)
+
+|Statistics|
+:Сформировать сводную таблицу результатов (ОР1)
+обработано, отказы 429, ср. время ожидания, загрузка приборов;
+stop
+@enduml

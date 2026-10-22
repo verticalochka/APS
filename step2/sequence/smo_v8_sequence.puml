@@ -1,0 +1,143 @@
+@startuml
+title СМО, вариант 8: ИБ ИЗ2 ПЗ1 Д1ОЗ2 Д1ОО4 Д2П2 Д2Б4 ОР1 ОД2
+
+control     "SimulationEngine"                       as Engine
+queue       "EventCalendar"                          as Calendar
+actor       "Source\n(ИБ, ИЗ2)"                      as Src
+control     "PlacementDispatcher\n(Д1ОЗ2, Д1ОО4)"    as PD
+queue       "Buffer\n(Д1ОЗ2)"                        as Buf
+control     "SelectionDispatcher\n(Д2П2, Д2Б4)"      as SD
+participant "Device[0..N-1]\n(ПЗ1)"                  as Dev
+database    "Statistics\n(ОР1)"                      as Stat
+
+note over Engine, Stat
+  Расшифровка кода варианта:
+  ИБ    - источник бесконечный (запросы поступают сколь угодно долго)
+  ИЗ2   - интервалы между заявками источника: равномерный закон Uniform(min, max)
+  ПЗ1   - время обслуживания на приборе: экспоненциальный закон Exp(mu)
+  Д1ОЗ2 - постановка в буфер: в порядке поступления, за последним занятым местом,
+          при освобождении места очередь сдвигается (буфер всегда плотный)
+  Д1ОО4 - отказ при переполнении: вытесняется ПОСЛЕДНЯЯ заявка в буфере (HTTP 429),
+          новая заявка занимает освободившееся место в конце очереди
+  Д2П2  - выбор прибора: по кольцу, поиск свободного прибора от указателя devicePtr
+  Д2Б4  - выбор заявки: приоритет по номеру источника (1 = Enterprise, 2 = Pro, 3 = Free),
+          по одной заявке, при равном приоритете - заявка, поставленная раньше
+  ОР1   - автоматический режим: сводная таблица результатов
+  ОД2   - пошаговый режим: формализованная схема состояния системы
+  Приборы не отказывают, они бывают только заняты. Отказ возможен только в буфере.
+end note
+
+== 1. Триггер: наступило событие «заявка сгенерирована» ==
+
+Engine -> Calendar: pollNext()
+Calendar --> Engine: Event(REQUEST_GENERATED, t, sourceId)
+Engine -> Engine: clock = t
+Engine -> Src: onGenerateEvent(t)
+Src -> Src: dt = nextInterval(), dt ~ Uniform(min, max)  (ИЗ2)
+Src -> Calendar: schedule(REQUEST_GENERATED, t + dt, sourceId)
+Calendar --> Src: событие добавлено
+Src -> Src: createRequest(t)
+note right of Src: Request: id, sourceId (= приоритет), tariff, createdAt = t
+Src -> PD: place(request, t)
+
+== 2. Диспетчер постановки: постановка в буфер или отказ ==
+
+PD -> Stat: recordGenerated(request)
+Stat --> PD: учтено
+PD -> Buf: isFull()
+Buf --> PD: true / false
+
+alt Буфер не полон (постановка, Д1ОЗ2)
+  PD -> Buf: append(request)
+  note right of Buf: Д1ОЗ2: заявка встаёт на место,\nследующее за последним занятым
+  Buf --> PD: позиция в очереди
+else Буфер переполнен: отказ (Д1ОО4)
+  PD -> Buf: removeLast()
+  note right of Buf: Д1ОО4: вытесняется последняя\nзаявка (самая свежая в буфере)
+  Buf --> PD: вытесненная заявка (evicted)
+  PD -> Stat: recordRefused(evicted)  (HTTP 429)
+  Stat --> PD: учтено
+  PD -> Buf: append(request)
+  note right of Buf: новая заявка занимает\nосвободившееся место в конце
+  Buf --> PD: позиция в очереди
+end
+
+== 3. Триггер: заявка появилась в буфере, диспетчер выбора ищет прибор ==
+
+PD -> SD: onRequestBuffered(t)
+SD -> Buf: isEmpty()
+Buf --> SD: false
+
+loop по кольцу от devicePtr, не более N проверок (Д2П2)
+  SD -> Dev: isFree()  [прибор idx = (devicePtr + i) mod N]
+  Dev --> SD: FREE / BUSY
+end
+
+alt Свободный прибор k найден (HappyFlow, если буфер был пуст)
+  SD -> Buf: pickByPriority()
+  note right of Buf: Д2Б4: заявка с минимальным номером источника,\nпри равенстве - с минимальным enqueuedAt.\nПакет из одной заявки.
+  Buf -> Buf: удалить заявку, сдвинуть очередь на одно место (Д1ОЗ2)
+  Buf --> SD: request
+  SD -> Stat: recordWait(request, t - enqueuedAt)
+  Stat --> SD: учтено
+  SD -> Dev: assign(request, t)
+  Dev -> Dev: serviceTime ~ Exp(mu)  (ПЗ1)
+  Dev --> SD: finishTime = t + serviceTime
+  SD -> Calendar: schedule(SERVICE_FINISHED, finishTime, deviceId)
+  Calendar --> SD: событие добавлено
+  SD -> SD: devicePtr = (k + 1) mod N  (Д2П2)
+else Все приборы заняты
+  SD -> SD: заявка остаётся в буфере, ждём события SERVICE_FINISHED
+end
+
+SD --> PD: обработка триггера завершена
+PD --> Src: PlacementResult (PLACED / PLACED_WITH_EVICTION)
+Src --> Engine: onGenerateEvent завершён
+
+note over Engine, Stat
+  ОД2: после каждого события Engine.getState() отдаёт состояние системы
+  (источники, буфер, приборы, devicePtr, календарь событий, % отказа)
+  для пошагового отображения.
+end note
+
+== 4. Триггер: «обслуживание завершено» (прибор освободился), выбор заявки из буфера ==
+
+Engine -> Calendar: pollNext()
+Calendar --> Engine: Event(SERVICE_FINISHED, t2, deviceId)
+Engine -> Engine: clock = t2
+Engine -> Dev: release(t2)
+Dev --> Engine: завершённая заявка (status = DONE)
+Engine -> Stat: recordProcessed(request, t2)
+Stat --> Engine: учтено
+Engine -> SD: onDeviceFreed(t2)
+SD -> Buf: isEmpty()
+Buf --> SD: true / false
+
+alt Буфер не пуст
+  loop по кольцу от devicePtr, не более N проверок (Д2П2)
+    SD -> Dev: isFree()  [прибор idx = (devicePtr + i) mod N]
+    Dev --> SD: FREE / BUSY
+  end
+  SD -> Buf: pickByPriority()
+  note right of Buf: Д2Б4: выбор одной заявки\nпо приоритету источника
+  Buf -> Buf: удалить заявку, сдвинуть очередь на одно место (Д1ОЗ2)
+  Buf --> SD: request
+  SD -> Stat: recordWait(request, t2 - enqueuedAt)
+  Stat --> SD: учтено
+  SD -> Dev: assign(request, t2)
+  Dev -> Dev: serviceTime ~ Exp(mu)  (ПЗ1)
+  Dev --> SD: finishTime
+  SD -> Calendar: schedule(SERVICE_FINISHED, finishTime, deviceId)
+  Calendar --> SD: событие добавлено
+  SD -> SD: devicePtr = (k + 1) mod N  (Д2П2)
+else Буфер пуст
+  SD -> SD: прибор простаивает до следующей заявки
+end
+SD --> Engine: обработка триггера завершена
+
+== 5. Завершение моделирования (автоматический режим, ОР1) ==
+
+Engine -> Stat: buildSummaryTable(clock)
+Stat --> Engine: SummaryTable (обработано, отказы 429, ср. время ожидания, загрузка приборов)
+
+@enduml

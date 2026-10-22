@@ -1,0 +1,266 @@
+@startuml
+title СМО, вариант 8: диаграмма классов
+skinparam classAttributeIconSize 0
+
+enum TariffType {
+  FREE
+  PRO
+  ENTERPRISE
+}
+
+enum RequestStatus {
+  CREATED
+  IN_BUFFER
+  PROCESSING
+  DONE
+  REFUSED
+}
+
+enum DeviceStatus {
+  FREE
+  BUSY
+}
+
+enum EventType {
+  REQUEST_GENERATED
+  SERVICE_FINISHED
+}
+
+enum PlacementResult {
+  PLACED
+  PLACED_WITH_EVICTION
+}
+
+class Request {
+  - id: long
+  - sourceId: int
+  - tariff: TariffType
+  - status: RequestStatus
+  - createdAt: double
+  - enqueuedAt: double
+  - serviceStartAt: double
+  - finishedAt: double
+  --
+  + getId(): long
+  + getSourceId(): int
+  + getPriority(): int
+  + getEnqueuedAt(): double
+  + markInBuffer(t: double): void
+  + markProcessing(t: double): void
+  + markDone(t: double): void
+  + markRefused(t: double): void
+}
+note right of Request
+  Приоритет по Д2Б4 = номер источника
+  (1 = Enterprise, 2 = Pro, 3 = Free).
+end note
+
+class Source {
+  - id: int
+  - tariff: TariffType
+  - minInterval: double
+  - maxInterval: double
+  - random: Random
+  - requestCounter: long
+  - calendar: EventCalendar
+  - placementDispatcher: PlacementDispatcher
+  --
+  + onGenerateEvent(now: double): void
+  - nextInterval(): double
+  - createRequest(now: double): Request
+}
+note right of Source
+  ИБ - источник бесконечный.
+  ИЗ2 - nextInterval() ~ Uniform(minInterval, maxInterval).
+end note
+
+class Buffer {
+  - slots: List<Request>
+  - capacity: int
+  --
+  + append(r: Request): int
+  + removeLast(): Request
+  + pickByPriority(): Request
+  + isFull(): boolean
+  + isEmpty(): boolean
+  + size(): int
+  + snapshot(): List<Request>
+  - findBestIndex(): int
+  - removeAtAndShift(index: int): Request
+}
+note right of Buffer
+  Д1ОЗ2 - append() ставит заявку за последним занятым
+  местом. removeAtAndShift() сдвигает очередь,
+  буфер всегда плотный, указателя нет.
+  Д1ОО4 - removeLast() вытесняет последнюю заявку.
+  Д2Б4 - pickByPriority(): минимальный sourceId,
+  при равенстве минимальный enqueuedAt, одна заявка.
+end note
+
+class Device {
+  - id: int
+  - status: DeviceStatus
+  - current: Request
+  - serviceRate: double
+  - busySince: double
+  - totalBusyTime: double
+  - random: Random
+  --
+  + isFree(): boolean
+  + assign(r: Request, now: double): double
+  + release(now: double): Request
+  + getTotalBusyTime(): double
+  - nextServiceTime(): double
+}
+note right of Device
+  ПЗ1 - nextServiceTime() ~ Exp(serviceRate).
+  assign() возвращает момент окончания обслуживания.
+  Прибор не отказывает, он бывает только занят.
+end note
+
+class PlacementDispatcher {
+  - buffer: Buffer
+  - statistics: Statistics
+  - selectionDispatcher: SelectionDispatcher
+  --
+  + place(r: Request, now: double): PlacementResult
+}
+note right of PlacementDispatcher
+  Д1ОЗ2 + Д1ОО4. Работает только с буфером,
+  о приборах ничего не знает. После постановки
+  вызывает SelectionDispatcher.onRequestBuffered().
+end note
+
+class SelectionDispatcher {
+  - buffer: Buffer
+  - devices: List<Device>
+  - devicePtr: int
+  - calendar: EventCalendar
+  - statistics: Statistics
+  --
+  + onRequestBuffered(now: double): void
+  + onDeviceFreed(now: double): void
+  + getDevicePtr(): int
+  - dispatch(now: double): void
+  - findFreeDevice(): Device
+}
+note right of SelectionDispatcher
+  Д2П2 - findFreeDevice() идёт по кольцу от devicePtr,
+  после назначения devicePtr = (k + 1) mod N.
+  Д2Б4 - заявка берётся через Buffer.pickByPriority().
+end note
+
+class Event {
+  - time: double
+  - type: EventType
+  - sourceId: int
+  - deviceId: int
+  --
+  + getTime(): double
+  + getType(): EventType
+  + getSourceId(): int
+  + getDeviceId(): int
+}
+
+class EventCalendar {
+  - events: PriorityQueue<Event>
+  --
+  + schedule(e: Event): void
+  + pollNext(): Event
+  + isEmpty(): boolean
+  + snapshot(): List<Event>
+}
+
+class Statistics {
+  - generatedBySource: Map<Integer, Integer>
+  - refusedBySource: Map<Integer, Integer>
+  - processedBySource: Map<Integer, Integer>
+  - totalWaitTime: double
+  - totalServiceTime: double
+  --
+  + recordGenerated(r: Request): void
+  + recordRefused(r: Request): void
+  + recordWait(r: Request, wait: double): void
+  + recordProcessed(r: Request, now: double): void
+  + refusalRate(): double
+  + deviceUtilization(d: Device, totalTime: double): double
+  + buildSummaryTable(totalTime: double): SummaryTable
+}
+note right of Statistics
+  ОР1 - buildSummaryTable(): обработано, отказы 429,
+  среднее время ожидания, загрузка приборов.
+end note
+
+class SummaryTable {
+  - rows: List<String[]>
+  --
+  + getRows(): List<String[]>
+}
+
+class SimulationEngine {
+  - clock: double
+  - calendar: EventCalendar
+  - sources: List<Source>
+  - devices: List<Device>
+  - buffer: Buffer
+  - placementDispatcher: PlacementDispatcher
+  - selectionDispatcher: SelectionDispatcher
+  - statistics: Statistics
+  --
+  + run(endTime: double): SummaryTable
+  + step(): void
+  + getState(): SystemState
+  - handleGenerated(e: Event): void
+  - handleServiceFinished(e: Event): void
+}
+note right of SimulationEngine
+  Единственный владелец модельного времени.
+  step() - пошаговый режим (ОД2), run() - автоматический (ОР1).
+end note
+
+class SystemState {
+  - clock: double
+  - bufferContent: List<Request>
+  - deviceStates: List<Device>
+  - devicePtr: int
+  - calendarContent: List<Event>
+  - refusalPercent: double
+  --
+  + getClock(): double
+  + getBufferContent(): List<Request>
+  + getDevicePtr(): int
+}
+
+Request --> TariffType
+Request --> RequestStatus
+Device --> DeviceStatus
+Event --> EventType
+PlacementDispatcher ..> PlacementResult
+
+Source --> EventCalendar : calendar
+Source --> PlacementDispatcher : placementDispatcher
+Source ..> Request : создаёт
+
+PlacementDispatcher --> Buffer : buffer
+PlacementDispatcher --> Statistics : statistics
+PlacementDispatcher --> SelectionDispatcher : selectionDispatcher
+
+SelectionDispatcher --> Buffer : buffer
+SelectionDispatcher "1" o-- "N" Device : devices
+SelectionDispatcher --> EventCalendar : calendar
+SelectionDispatcher --> Statistics : statistics
+
+Buffer "1" o-- "0..capacity" Request : slots
+Device "1" --> "0..1" Request : current
+EventCalendar "1" o-- "*" Event : events
+Statistics ..> SummaryTable : создаёт
+
+SimulationEngine --> EventCalendar
+SimulationEngine "1" o-- "M" Source
+SimulationEngine "1" o-- "N" Device
+SimulationEngine --> Buffer
+SimulationEngine --> PlacementDispatcher
+SimulationEngine --> SelectionDispatcher
+SimulationEngine --> Statistics
+SimulationEngine ..> SystemState : формирует
+@enduml
